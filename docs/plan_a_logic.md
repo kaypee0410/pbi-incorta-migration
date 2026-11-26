@@ -42,7 +42,9 @@ cardinality, cross-filter direction, data types), never from a table, column, me
 | `KEEPFILTERS(ALL(...))` | nothing |
 
 The same function decides the outer CALCULATE filters a removal clears (translator), the window's
-`PARTITION BY` and the slicer flag (insight SQL), and the `groupBy()` columns (Incorta).
+`PARTITION BY` and the slicer flag (insight SQL), and the `groupBy()` columns (Incorta), for level-based totals and
+for `RANKX(ALL / ALLSELECTED(...), ...)`: `rank(groupBy(insight dims − cleared), orderBy(...))`, through lookups
+(`RANKX(ALL(Dim))` also clears the tables Dim looks up). Plain SQL still flags RANKX for review.
 
 ## Rules (input shape → SQL → pattern / status → Incorta)
 

@@ -90,6 +90,10 @@ MEASURES = {
     "bidir_aggregate": "CALCULATE(COUNTROWS(Store), ALL(Sales))",
     "userel": "CALCULATE([m], USERELATIONSHIP(Sales[ShipDate], 'Date'[Date]), ALL('Date'))",
     "sel_outer": 'CALCULATE(CALCULATE([m], ALLSELECTED(Product[Color])), Product[Color] = "Red")',
+    # RANKX: Incorta rank(groupBy(insight dims - what ALL removes), ...)
+    "rank_col": "RANKX(ALL(Product[Color]), [m])",
+    "rank_dim": "RANKX(ALL(Product), [m])",
+    "rank_sel": "RANKX(ALLSELECTED(Product[Color]), [m])",
 }
 
 
@@ -424,10 +428,48 @@ def test_top_n_with_a_window_total_is_flagged():
     assert plan["approach"] == "Needs review"
 
 
+def _incorta():
+    """An Incorta planner with just what its insight formulas need (names, graph, column types)."""
+    from pbi_insights.incorta.plan import IncortaNames, IncortaPlanner
+    p = IncortaPlanner.__new__(IncortaPlanner)
+    p.translator, p.model, p.names, p.cols, p.sources = TR, MODEL, IncortaNames("S", "BS"), {}, {}
+    return p
+
+
+def _group_by(text: str) -> list[list[str]]:
+    import re
+    return [[x.strip() for x in g.split(",") if x.strip()] for g in re.findall(r"groupBy\(([^)]*)\)", text)]
+
+
+@pytest.mark.parametrize("name, dims, kept", [
+    ("rank_col", [COLOR, YEAR], [YEAR]),                       # RANKX(ALL(Product[Color])): rank colors within a year
+    ("rank_col", [COLOR, NAME], [NAME]),                       # only the column goes, not the rest of Product
+    ("rank_dim", [NAME, YEAR], [YEAR]),                        # ALL(Product): every Product column
+    ("rank_dim", [CAT, NAME, YEAR], [YEAR]),                   # ... and Category, a lookup of the lookup
+    ("rank_dim", [CAT, REGION], [REGION]),
+    ("rank_sel", [COLOR, YEAR], [YEAR]),                       # ALLSELECTED: same columns as ALL
+])
+def test_incorta_rank_groupby_uses_the_expanded_table(name, dims, kept):
+    res, pattern, _ = measure(name)
+    assert pattern == "Ranking (needs review)" and res.status == REVIEW      # plain SQL has no rank window
+    p = _incorta()
+    text = p.insight_formula(res.ir, {"dims": [{"table": t, "column": c} for t, c in dims]})
+    assert text and text.startswith("rank(groupBy("), text
+    assert _group_by(text) == [[p.names.full(t, c) for t, c in kept]], text
+
+
+def test_incorta_level_groupby_uses_the_expanded_table():
+    p = _incorta()
+    for name, dims, kept in (("all_dim", [CAT, YEAR], [YEAR]), ("all_col", [COLOR, NAME], [NAME]),
+                             ("except", [COLOR, YEAR], [COLOR]), ("all_lookup2", [CAT, NAME], [NAME])):
+        text = p.insight_formula(TR.measure(name).ir, {"dims": [{"table": t, "column": c} for t, c in dims]})
+        assert {tuple(g) for g in _group_by(text)} == {tuple(p.names.full(t, c) for t, c in kept)}, (name, text)
+
+
 def test_incorta_groupby_uses_the_expanded_table():
     from pbi_insights.incorta.plan import IncortaPlanner
     removes = GRAPH.removal(("Product",))
     dims = [{"table": "Category", "column": "CatName"}, {"table": "Date", "column": "Year"}]
     kept = [d["column"] for d in dims if not removes(d["table"], d["column"])]
-    assert kept == ["Year"]                                   # the rule IncortaPlanner._dims_except(expand=True) uses
-    assert "expand" in IncortaPlanner._dims_except.__code__.co_varnames
+    assert kept == ["Year"]                                   # the rule IncortaPlanner._dims_except uses (level and rank)
+    assert "keep" in IncortaPlanner._dims_except.__code__.co_varnames

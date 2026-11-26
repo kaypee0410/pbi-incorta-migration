@@ -1032,13 +1032,7 @@ class IncortaPlanner:
                     notes.append(f"{mn}: waits for decision {mrow.get('decision') or '(see Decision Log)'}")
                     continue
                 if mrow["home"].startswith("Insight formula (groupBy"):
-                    m = self.mindex[mn]
-                    text, _ = self.formula(m["translation"].ir,
-                                           level_dims=lambda n, p=p: self._dims_except(p, n.tables, n.columns, n.keep,
-                                                                                       expand=True),
-                                           rank_dims=lambda n, p=p: self._dims_except(
-                                               p, [x for x in n.over if isinstance(x, str)],
-                                               [x for x in n.over if isinstance(x, Col)]))
+                    text = self.insight_formula(self.mindex[mn]["translation"].ir, p)
                     formulas.append({"measure": mn, "formula": text})
             ts = [mn for mn in mnames if {"ago", "toDate"} & set(
                 (next((r for r in self.measure_rows if r["measure"] == mn), {}) or {}).get("features", []))]
@@ -1092,14 +1086,20 @@ class IncortaPlanner:
         return any(r.get("from_table") == table and r.get("from_cardinality") == "many"
                    for r in self.model.get("relationships", []))
 
-    def _dims_except(self, plan, tables, columns, keep=(), expand: bool = False) -> list[str]:
-        """The insight's grouping columns a removal keeps. `expand`: a table argument clears its DAX expanded table
-        (the table and every table it looks up), the same rule the SQL window uses (RelGraph.removal)."""
-        if expand:
-            graph = self.translator.graph or RelGraph(self.model.get("relationships", []))
-            removes = graph.removal(tables, columns, keep)
-        else:
-            removes = lambda t, c: "*" in tables or t in tables or Col(t, c) in columns   # noqa: E731
+    def insight_formula(self, ir, plan) -> str | None:
+        """A measure's Incorta formula in one insight: level-based totals (groupBy) and ranks (rank(groupBy(...)))
+        keep the insight's grouping columns that the removal does not clear."""
+        text, _ = self.formula(
+            ir, level_dims=lambda n: self._dims_except(plan, n.tables, n.columns, n.keep),
+            rank_dims=lambda n: self._dims_except(plan, [x for x in n.over if isinstance(x, str)],
+                                                  [x for x in n.over if isinstance(x, Col)]))
+        return text
+
+    def _dims_except(self, plan, tables, columns, keep=()) -> list[str]:
+        """The insight's grouping columns a removal keeps: a table argument clears its DAX expanded table (the table
+        and every table it looks up), the same rule the SQL window uses (RelGraph.removal); RANKX(ALL(...)) too."""
+        graph = self.translator.graph or RelGraph(self.model.get("relationships", []))
+        removes = graph.removal(tables, columns, keep)
         out = []
         for d in plan.get("dims") or []:
             if removes(d["table"], d["column"]):
