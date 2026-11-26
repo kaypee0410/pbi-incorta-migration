@@ -53,7 +53,6 @@ def test_all_on_the_whole_table_is_a_subquery(tr):                              
     assert any(n.startswith("ALL / REMOVEFILTERS removes every filter on Sales") for n in res.notes)
 
 
-@pytest.mark.xfail(strict=True, reason="Change 3: generic SQL still writes visual_... for a constant in a filter")
 def test_filter_independent_value_inside_a_filter_stays_a_subquery(tr):                             # 2
     for name in ("From Last Day", "Direct Last Day"):
         res, pattern, sql = tr(name)
@@ -120,6 +119,12 @@ def test_insight_window_partitions_by_the_other_dimensions(tr):                 
     assert {k: round(v, 9) for k, v in by_size.items()} == {"Big": 1, "Small": 1}
     assert {(r, s): round(v, 6) for r, s, v in got} == {("East", "Big"): 1, ("East", "Small"): round(35 / 51, 6),
                                                          ("West", "Small"): round(16 / 51, 6)}
+
+
+def test_insight_joins_a_filter_independent_value_once(tr):                                         # 2, insight SQL
+    plan = _plan(tr, "From Last Day", [("Store", "Region")])
+    assert not plan.reviews and "visual_" not in plan.sql
+    assert "CROSS JOIN v1_sales" in plan.sql and "MAX(s.Day) AS val" in plan.sql
 
 
 def test_a_slicer_on_a_removed_column_is_flagged(tr):

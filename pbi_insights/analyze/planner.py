@@ -7,7 +7,7 @@ import logging
 from .dax_parser import DaxSyntaxError, parse_dax, walk as ast_walk
 from .dax_translate import ModelIndex, Translator, classify_measure
 from .graph import RelGraph
-from .ir import Agg, Bin, Col, Fn, InList, Lit, Null, Un, aggs_in, cols_in
+from .ir import Agg, Bin, Col, Fn, InList, Lit, Null, Scalar, Total, Un, aggs_in, cols_in
 from .querygen import Dim, FilterSpec, MeasureSpec, Naming, QueryBuilder, QueryPlan, SortSpec
 from .sqlrender import Renderer, column, snake
 
@@ -152,7 +152,9 @@ def cond_tree_ir(node: dict, idx: ModelIndex):
 def generic_measure_sql(ir, dialect: str) -> str:
     """A measure's logic as one SQL expression, columns qualified by their table name."""
     def ctx(v):                                            # computed first, at the grain of the visual
-        a = v if isinstance(v, Agg) else next((x for x in aggs_in(v, into_scalar=True)), None)
+        if isinstance(v, Scalar) or (isinstance(v, Total) and v.independent):
+            return scalar(v if isinstance(v, Scalar) else Scalar(v.expr, v.independent))   # no filter reaches it:
+        a = v if isinstance(v, Agg) else next((x for x in aggs_in(v, into_scalar=True)), None)   # the same everywhere
         label = f"{a.func.lower()}_{a.arg.column}" if a is not None and isinstance(a.arg, Col) else "value"
         e = column(snake(f"visual_{label}"))
         e.add_comments([" value of the visual, computed first: see the insight SQL "])
