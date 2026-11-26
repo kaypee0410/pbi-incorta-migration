@@ -6,7 +6,8 @@ import re
 from sqlglot import exp
 
 from .ir import (NESTED_TOTAL, WINDOW_AGG, Agg, BlankArith, Bin, Case, Col, CorrAgg, Fn, InList, IsNull, Lit, Lookup,
-                 Null, OuterCol, Rank, Review, SafeDiv, Scalar, Star, TimeShift, Total, Un, sql_gaps, windowable_total)
+                 Null, OuterCol, Rank, Review, SafeDiv, Scalar, Star, TimeShift, Total, Un, removal_text, sql_gaps,
+                 windowable_total)
 
 RESERVED = {
     "ADD", "ALL", "ALTER", "AND", "ANY", "AS", "ASC", "BETWEEN", "BY", "CASE", "CAST", "CHECK", "COLUMN",
@@ -181,8 +182,7 @@ class Renderer:
         if self.total_fn:
             part, comment = self.total_fn(n), None
         else:
-            removed = ", ".join(["every table" if t == "*" else t for t in n.tables]
-                                + [f"{c.table}[{c.column}]" for c in n.columns])
+            removed = removal_text(n)
             what = (f"the visual's own grouping by {removed} (slicers stay)" if n.kind == "ALLSELECTED"
                     else f"the visual's dimensions except {removed}")
             part, comment = [], f" PARTITION BY {what} "

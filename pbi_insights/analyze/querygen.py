@@ -327,11 +327,8 @@ class QueryBuilder:
 
     # ---- totals at a coarser grain (ALL / REMOVEFILTERS / ALLSELECTED): group first, then a window ----------------
     def _removes(self, t: Total):
-        """(table, column) -> does the total remove the filters / grouping on this column?"""
-        tables = set()
-        for x in t.tables:
-            tables |= self._reach(x) if x != "*" else set()
-        return lambda table, col: "*" in t.tables or table in tables or Col(table, col) in t.columns
+        """(table, column) -> does the total remove the filters / grouping on this column? (expanded tables)"""
+        return self.graph.removal(t.tables, t.columns, t.keep)
 
     def _windowed(self, dims, measures, filters, sorts, plan: QueryPlan) -> QueryPlan:
         """Inner query: one row per group of the visual with every aggregate as a column. Outer query: the measures,
@@ -356,8 +353,11 @@ class QueryBuilder:
                     spec = MeasureSpec(name=f"agg_{len(inner) + 1}", out=f"agg_{len(inner) + 1}", ir=a)
                     inner.append(spec)
                     cols[repr(a)] = spec
+        def drops(t: Total) -> bool:
+            removes = self._removes(t)
+            return any(removes(d.table, d.column) for d in dims)
         for m in measures if dims else ():
-            if _has_fixed_value(m.ir) and not _blank_without_rows(m.ir):
+            if _has_fixed_value(m.ir, drops) and not _blank_without_rows(m.ir):
                 self._review(plan, f"[{m.name}] has a value for groups without rows (it uses a total that does not "
                                    f"come from the group's own rows): Power BI shows those groups too, the SQL does not")
         self._name_outputs(dims, inner)                    # same dimension names as the measures got in build()
@@ -658,12 +658,15 @@ def _same(a: exp.Expression, b: exp.Expression) -> exp.Expression:
     return exp.Paren(this=exp.Or(this=exp.EQ(this=a, expression=b), expression=exp.Paren(this=both)))
 
 
-def _has_fixed_value(n) -> bool:
+def _has_fixed_value(n, drops=None) -> bool:
     """A value outside the aggregates that does not come from the group's own rows: filter-independent, or a total at
-    a coarser grain."""
+    a coarser grain. `drops(total)`: does the window leave out one of the visual's dimensions? A window that keeps
+    them all is just the group's own value."""
     if isinstance(n, Agg):
         return False
-    return isinstance(n, Scalar) or isinstance(n, Total) or any(_has_fixed_value(c) for c in children(n))
+    if windowable_total(n) and drops is not None:
+        return drops(n)
+    return isinstance(n, Scalar) or isinstance(n, Total) or any(_has_fixed_value(c, drops) for c in children(n))
 
 
 def _window_totals(n) -> list:

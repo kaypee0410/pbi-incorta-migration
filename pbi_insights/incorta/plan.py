@@ -13,6 +13,7 @@ import re
 
 from ..analyze.dax_translate import SQL_GAP_PREFIXES, ModelIndex, Translator
 from ..analyze.formulas import ToolFormula, _Unsupported
+from ..analyze.graph import RelGraph
 from ..analyze.ir import Agg, Col, CorrAgg, Fn, Lit, Lookup, Rank, Review, TimeShift, Total, aggs_in, walk
 from ..extract.mquery import split_top_level
 from . import sparksql
@@ -43,6 +44,11 @@ VISUAL_MAP = {
     "basicShape": "Shape (recreate by hand)", "actionButton": "Button (not migrated)",
 }
 _REF = re.compile(r"^(.*)\[(.*)\]$")
+
+
+def _removal_kinds(ir) -> set[str]:
+    """Kinds (ALL, ALLSELECTED) of the filter removals in a measure."""
+    return {n.kind for n in walk(ir) if isinstance(n, Total)} if ir is not None else set()
 
 
 def ident(name: str) -> str:
@@ -878,9 +884,14 @@ class IncortaPlanner:
                 row["notes"].append("time series: add it to the Measure tray of an insight grouped by "
                                     "Date.Date (Date Part = Month)")
             if "groupBy" in used:
-                row["notes"].append(f"{MANUAL} level-based measure: groupBy() lists the insight's grouping columns "
-                                    f"that Power BI keeps (same order). Dashboard filters on the removed columns still "
-                                    f"apply in Incorta, while REMOVEFILTERS ignores them in Power BI")
+                if _removal_kinds(ir) == {"ALLSELECTED"}:
+                    row["notes"].append("level-based measure: groupBy() lists the insight's grouping columns that "
+                                        "Power BI keeps (same order). Dashboard filters apply in Incorta, and ALLSELECTED "
+                                        "keeps the slicers in Power BI too")
+                else:
+                    row["notes"].append(f"{MANUAL} level-based measure: groupBy() lists the insight's grouping columns "
+                                        f"that Power BI keeps (same order). Dashboard filters on the removed columns "
+                                        f"still apply in Incorta, while ALL / REMOVEFILTERS ignores them in Power BI")
             if "rank" in used:
                 row["notes"].append("rank: groupBy() lists the insight's other grouping columns (rank within them); "
                                     "hide the total row (Power BI shows no rank there)")
@@ -1023,7 +1034,8 @@ class IncortaPlanner:
                 if mrow["home"].startswith("Insight formula (groupBy"):
                     m = self.mindex[mn]
                     text, _ = self.formula(m["translation"].ir,
-                                           level_dims=lambda n, p=p: self._dims_except(p, n.tables, n.columns),
+                                           level_dims=lambda n, p=p: self._dims_except(p, n.tables, n.columns, n.keep,
+                                                                                       expand=True),
                                            rank_dims=lambda n, p=p: self._dims_except(
                                                p, [x for x in n.over if isinstance(x, str)],
                                                [x for x in n.over if isinstance(x, Col)]))
@@ -1080,10 +1092,17 @@ class IncortaPlanner:
         return any(r.get("from_table") == table and r.get("from_cardinality") == "many"
                    for r in self.model.get("relationships", []))
 
-    def _dims_except(self, plan, tables, columns) -> list[str]:
+    def _dims_except(self, plan, tables, columns, keep=(), expand: bool = False) -> list[str]:
+        """The insight's grouping columns a removal keeps. `expand`: a table argument clears its DAX expanded table
+        (the table and every table it looks up), the same rule the SQL window uses (RelGraph.removal)."""
+        if expand:
+            graph = self.translator.graph or RelGraph(self.model.get("relationships", []))
+            removes = graph.removal(tables, columns, keep)
+        else:
+            removes = lambda t, c: "*" in tables or t in tables or Col(t, c) in columns   # noqa: E731
         out = []
         for d in plan.get("dims") or []:
-            if "*" in tables or d["table"] in tables or Col(d["table"], d["column"]) in columns:
+            if removes(d["table"], d["column"]):
                 continue
             out.append(self.names.full(d["table"], d["column"]))
         return out
@@ -1166,8 +1185,12 @@ class IncortaPlanner:
                     f"Measure {m['measure']}", f"Design {m['measure']} in Incorta",
                     _design_options(m), "(a)" if "TOPN" in m["dax"].upper() else "",
                     "; ".join(m["notes"]) or "the rule engine has no automatic home for it", source="Rule")
-        lbm = [m["measure"] for m in self.measure_rows if "groupBy" in m.get("features", [])]
-        if lbm:
+        def ir_of(name):
+            tr = (self.mindex.get(name) or {}).get("translation")
+            return tr.ir if tr is not None else None
+        lbm = [m["measure"] for m in self.measure_rows if "groupBy" in m.get("features", [])
+               and _removal_kinds(ir_of(m["measure"])) != {"ALLSELECTED"}]
+        if lbm:                                            # ALLSELECTED keeps the slicers in Power BI too
             self.check(f"Measures {', '.join(lbm)}", "REMOVEFILTERS / ALL ignores slicers on the removed table in Power "
                        "BI; an Incorta level-based measure still applies dashboard filters on those columns",
                        "the share / benchmark differs when a dashboard filter is set on the removed table's columns",

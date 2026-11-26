@@ -171,6 +171,7 @@ class Total:
     columns: tuple = ()          # (Col, ...)
     independent: str = ""        # table the value is computed on when no filter of the report can reach it
     kind: str = "ALL"            # ALL (also REMOVEFILTERS) or ALLSELECTED (keeps slicers, removes the visual's grouping)
+    keep: tuple = ()             # (Col, ...) columns ALLEXCEPT keeps inside the removed tables' expanded tables
 
 
 WINDOW_AGG = {"SUM": "SUM", "COUNT": "SUM", "MIN": "MIN", "MAX": "MAX"}     # aggregate -> how its group values add up
@@ -204,6 +205,24 @@ def window_total_issue(t: Total) -> str:
 
 def windowable_total(n) -> bool:
     return isinstance(n, Total) and not n.independent and not window_total_issue(n)
+
+
+def removal_text(t: Total) -> str:
+    """What a filter removal clears, for notes and SQL comments: "Dim, Fact[c]" / "every table" / "Fact except Dim[k]"."""
+    what = ", ".join(["every table" if x == "*" else x for x in t.tables] + [f"{c.table}[{c.column}]" for c in t.columns])
+    if t.keep:
+        what += " (keeping " + ", ".join(f"{c.table}[{c.column}]" for c in t.keep) + ")"
+    return what
+
+
+def is_constant(n) -> bool:
+    """The same value on every row of every visual: no aggregate of the visual's rows, no column, no review, only
+    literals and filter-independent values (Scalar / independent Total)."""
+    if isinstance(n, Scalar) or (isinstance(n, Total) and n.independent):
+        return True
+    if isinstance(n, (Agg, Col, OuterCol, Review, TimeShift, Rank, CorrAgg, Lookup, Total)):
+        return False
+    return all(is_constant(c) for c in children(n))
 
 
 IR_TYPES = (Col, Lit, Null, Star, Agg, Bin, Un, Case, Fn, SafeDiv, BlankArith, IsNull, InList, Scalar, Review,

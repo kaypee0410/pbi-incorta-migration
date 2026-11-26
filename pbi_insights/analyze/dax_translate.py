@@ -15,7 +15,9 @@ from dataclasses import dataclass, field, replace
 from .dax_parser import DaxSyntaxError, functions_used, parse_dax
 from .ir import (Agg, BlankArith, Bin, Case, Col, CorrAgg, Fn, InList, IsNull, Lit, Lookup, Null, OuterCol, Rank,
                  Review, SafeDiv, Scalar, Star, TimeShift, Total, Un, aggs_in, and_, cols_in, conjuncts, has_agg, has_outer,
-                 is_boolean, override, reviews_in, row_cols, transform, walk, window_total_issue, windowable_total)
+                 is_boolean, is_constant, override, removal_text, reviews_in, row_cols, top_aggs, transform, walk,
+                 window_total_issue, windowable_total)
+from .graph import RelGraph
 
 AGG = {"SUM": "SUM", "AVERAGE": "AVG", "MIN": "MIN", "MAX": "MAX", "COUNT": "COUNT", "COUNTA": "COUNT",
        "MEDIAN": "MEDIAN"}
@@ -308,7 +310,7 @@ class Translator:
             if not ctx.calc and name not in self._stack:   # a value no filter can reach is the same on every row
                 sizes = len(self.acc.notes), len(self.acc.patterns), len(self.acc.reviews)
                 ir = self.measure_ref(name, _Ctx(host=self.idx.measures[name]["table"]))
-                if isinstance(ir, Scalar) or (isinstance(ir, Total) and ir.independent):
+                if is_constant(ir):
                     return ir
                 del self.acc.notes[sizes[0]:], self.acc.patterns[sizes[1]:], self.acc.reviews[sizes[2]:]
             return self.review(f"measure [{name}] evaluated per row (context transition): needs a grouped subquery")
@@ -672,6 +674,8 @@ class Translator:
         pctx = replace(ctx, mode="row", any_table=True)
         for f in extra:
             kind, payload = self.filter_arg(f, pctx)
+            if kind == "none":
+                continue
             if kind not in ("pred", "keep", "tkeep"):
                 return self.review(payload if kind == "review" else f"{name} with a {kind} filter")
             if kind == "pred":
@@ -841,7 +845,7 @@ class Translator:
         if ctx.mode == "row":                              # context transition: only a total nothing can filter survives it
             before = len(self.acc.reviews)
             inner = self._calculate(a, ctx)
-            if isinstance(inner, Total) and inner.independent or isinstance(inner, Review):
+            if is_constant(inner) or isinstance(inner, Review):
                 return inner
             del self.acc.reviews[before:]
             return self.review("CALCULATE evaluated per row (context transition): needs a grouped subquery")
@@ -869,15 +873,22 @@ class Translator:
                     return self.review("two time-intelligence filters in one CALCULATE")
                 shift = payload
             elif kind == "total":
-                tables, cols, rkind = removed or ((), (), payload[2])
+                tables, cols, rkind, kept = removed or ((), (), payload[2], ())
                 if rkind != payload[2]:
                     return self.review("ALL / REMOVEFILTERS and ALLSELECTED in one CALCULATE: needs a separate dataset")
-                removed = (tables + tuple(x for x in payload[0] if x not in tables),
-                           cols + tuple(x for x in payload[1] if x not in cols), rkind)
+                if removed and (kept or payload[3]):
+                    return self.review("ALLEXCEPT together with another filter removal: needs a separate dataset")
+                removed =(tables + tuple(x for x in payload[0] if x not in tables),
+                           cols + tuple(x for x in payload[1] if x not in cols), rkind, kept + payload[3])
+            elif kind == "none":
+                continue
             else:
                 return self.review(payload)
         if independent and (new is not None or keep is not None or tfilters):
             return self.review("FILTER(ALL(...)) combined with other filters: needs a separate dataset")
+        if removed and removed[2] == "ALLSELECTED" and self._without(ctx.pred, removed) != ctx.pred:
+            return self.review("ALLSELECTED under an outer CALCULATE that filters the same columns: ALLSELECTED uses the "
+                               "filters of the visual's query, not those of the outer CALCULATE; check in Power BI")
         pred = self._without(ctx.pred, removed) if removed else ctx.pred
         if tfilters:                                       # FILTER(T) sees the outer filters on T and what it looks up
             seen = set()
@@ -905,26 +916,9 @@ class Translator:
         if shift or removed:
             inner = _replaces(self.tr(expr, ctx_in), replaced)
             if removed:
-                tables, cols, rkind = removed
-                alone = ("" if shift or tfilters or rkind == "ALLSELECTED"
-                         else self._independent_of_filters(inner, removed))
-                inner = Total(inner, tables, cols, alone, rkind)
-                if alone:
-                    self.pattern("Filter-independent (ALL)")
-                    self.note(f"ALL / REMOVEFILTERS removes every filter on {alone} and the tables it looks up, so this "
-                              f"value ignores slicers and filters on them.")
-                elif window_total_issue(inner):
-                    self.pattern("Share of total (REMOVEFILTERS)")
-                else:
-                    self.pattern("Total at a coarser grain (ALL)")
-                    what = ", ".join(["every table" if t == "*" else t for t in tables]
-                                     + [f"{c.table}[{c.column}]" for c in cols])
-                    if rkind == "ALLSELECTED":
-                        self.note(f"ALLSELECTED({what}) keeps the slicers and page filters (they stay in the WHERE); the "
-                                  f"SQL window removes only the visual's own grouping by {what}.")
-                    else:
-                        self.note(f"ALL / REMOVEFILTERS on {what}: the total is a window over the visual's rows, "
-                                  f"partitioned by the visual's dimensions except those.")
+                inner = self._removal_total(inner, removed, may_be_constant=not (shift or tfilters))
+                if isinstance(inner, Review):
+                    return inner
             if shift:
                 self.pattern("Time intelligence")
                 inner = TimeShift(inner, *shift)
@@ -938,53 +932,101 @@ class Translator:
                                    f"needs a window function")
             inner = self.tr(expr, replace(ctx, pred=cond))
             agg_tables = {x.table for x in aggs_in(inner)}
-            lookup = set(self.graph.reachable(table)) if self.graph else set()
-            if agg_tables == {table} and all(x.table in {table} | lookup for x in cols_in(inner)):
+            g = self._g()
+            if (agg_tables == {table} and all(x.table in g.expanded(table) for x in cols_in(inner))
+                    and not g.reverse_entry(g.expanded(table))):
                 self.pattern("Filter-independent (ALL)")
                 note = (f"ALL({table}) removes every filter on {table} and the tables it looks up, "
                         f"so this value ignores slicers and filters on them.")
                 self.note(note)
                 return Scalar(inner, table, note)
-            return self.review(f"FILTER(ALL({table}), ...) around an aggregation of another table: "
-                               f"needs a separate dataset or a window function")
+            # FILTER(ALL(T), cond) replaces every filter on expanded(T) with cond: a removal of T, then cond
+            removal = ((table,), (), "ALL", ())
+            inner = self.tr(expr, replace(ctx, pred=and_(self._without(ctx.pred, removal), cond)))
+            if any(c.table not in g.expanded(a.table) for a in top_aggs(inner) for c in cols_in(a)):
+                return self.review(f"FILTER(ALL({table}), ...) filters an aggregate of a table it cannot reach "
+                                   f"(through {table}'s expanded table): needs a separate dataset")
+            return self._removal_total(inner, removal, may_be_constant=True)
         if pred is not ctx.pred:
             self.pattern("Filtered aggregate (CALCULATE)")
         return _replaces(self.tr(expr, ctx_in), replaced)
 
+    def _g(self) -> RelGraph:
+        return self.graph if self.graph is not None else RelGraph([])
+
+    def _removes(self, removed):
+        tables, columns, _, kept = removed
+        return self._g().removal(tables, columns, kept)
+
     def _without(self, pred, removed):
-        """The filters of an outer CALCULATE that REMOVEFILTERS / ALL clears: (tables, columns)."""
-        tables, columns = removed[:2]
-        if "*" in tables:
-            return None
-        cleared = set(tables)
-        for t in tables:                                   # ALL(T) clears T and the tables it looks up
-            cleared |= set(self.graph.reachable(t)) if self.graph else set()
+        """The filters of an outer CALCULATE that a removal (tables, columns, kind, kept) clears: a condition goes when
+        every column it tests is cleared (ALL(T) clears T's expanded table)."""
+        removes = self._removes(removed)
         out = None
         for c in conjuncts(pred):
-            if not all(x.table in cleared or x in columns for x in row_cols(c)) or not row_cols(c):
+            if not row_cols(c) or not all(removes(x.table, x.column) for x in row_cols(c)):
                 out = and_(out, c)
         return out
 
-    def _independent_of_filters(self, inner, removed) -> str:
-        """The table of `inner` when REMOVEFILTERS / ALL clears everything that can filter it: every table that
-        filters T is one T looks up (no both-way or many-to-many relationship around it). "" otherwise."""
-        tables, columns = removed[:2]
-        aggs = aggs_in(inner)
-        host = {a.table for a in aggs}
-        if len(host) != 1 or columns or self.graph is None or any(
-                isinstance(n, (Review, Total, Scalar, TimeShift, Rank, CorrAgg, Lookup)) for n in walk(inner)):
-            return ""
-        t = next(iter(host))
-        if "*" not in tables and t not in tables:
-            return ""
-        if any(has_agg(a.pred) for a in aggs if a.pred is not None):
-            return ""
-        around = {t} | set(self.graph.reachable(t))
-        if any({r["from_table"], r["to_table"]} & around for r in self.graph.both_direction + self.graph.many_to_many):
-            return ""
-        if not {c.table for c in cols_in(inner)} <= around:
-            return ""
-        return t
+    def _covers(self, removes, table: str) -> bool:
+        """Does the removal clear every column of every table in expanded(table)?"""
+        for t in self._g().expanded(table):
+            cols = [c for (tt, c) in self.idx.columns if tt == t]
+            if not (cols and all(removes(t, c) for c in cols)) and not (not cols and (removes.everything or t in removes.tables)):
+                return False
+        return True
+
+    def _removal_total(self, inner, removed, may_be_constant: bool):
+        """CALCULATE(inner, <removal>) after the removal cleared the outer filters it covers. One of:
+        no effect (the removal meets no table that filters the aggregates) -> inner;
+        Case 1, filter-independent (it clears every column of each aggregate's expanded table) -> a constant;
+        Case 2, a total at a coarser grain -> Total (a window when its aggregates are additive);
+        a removal or an aggregate reached through a bidirectional / many-to-many / one-to-one relationship -> Review."""
+        tables, cols, rkind, kept = removed
+        g, removes = self._g(), self._removes(removed)
+        aggs = top_aggs(inner)
+        hosts = list(dict.fromkeys(a.table for a in aggs))
+        for t in hosts + [t for t in tables if t != "*"]:
+            why = g.reverse_entry(g.expanded(t))
+            if why:
+                return self.review(f"filter removal through a {why}: check in Power BI")
+        total = Total(inner, tables, cols, "", rkind, kept)
+        what = removal_text(total)
+
+        def meets(h):
+            exp_h = g.expanded(h)
+            return removes.everything or bool(removes.tables & exp_h) or any(c.table in exp_h for c in cols)
+        if not aggs and is_constant(inner):
+            return inner
+        if aggs and not any(meets(h) for h in hosts):
+            self.note(f"The removal on {what} clears no filter of the aggregated tables ({', '.join(hosts)}): no effect.")
+            return inner
+        blocked = any(isinstance(n, (Review, Total, Scalar, TimeShift, Rank, CorrAgg, Lookup)) for n in walk(inner))
+
+        def constant(a) -> bool:                           # nothing the report filters can reach this aggregate
+            return (self._covers(removes, a.table) and not (a.pred is not None and has_agg(a.pred))
+                    and {c.table for c in cols_in(a)} <= g.expanded(a.table))
+        if may_be_constant and rkind == "ALL" and aggs and not blocked and all(constant(a) for a in aggs):
+            self.pattern("Filter-independent (ALL)")
+            self.note(f"ALL / REMOVEFILTERS removes every filter on {', '.join(hosts)} and the tables it looks up, so "
+                      f"this value ignores slicers and filters on them.")
+            if len(hosts) == 1:
+                return replace(total, independent=hosts[0])
+            return transform(inner, lambda n: Total(n, tables, cols, n.table, rkind, kept) if isinstance(n, Agg) else n)
+        if window_total_issue(total):
+            self.pattern("Share of total (REMOVEFILTERS)")
+            return total
+        self.pattern("Total at a coarser grain (ALL)")
+        if rkind == "ALLSELECTED":
+            self.note(f"ALLSELECTED({what}) keeps the slicers and page filters (they stay in the WHERE); the SQL window "
+                      f"removes only the visual's own grouping by {what}.")
+        elif kept:
+            self.note(f"ALLEXCEPT({what}): the total is a window over the visual's rows, partitioned by the visual's "
+                      f"dimensions that ALLEXCEPT keeps or that lie outside the expanded table.")
+        else:
+            self.note(f"ALL / REMOVEFILTERS on {what}: the total is a window over the visual's rows, partitioned by the "
+                      f"visual's dimensions except those (and the tables they look up).")
+        return total
 
     def filter_arg(self, f, pctx: _Ctx):
         if f[0] == "func":
@@ -1002,21 +1044,29 @@ class Translator:
                         return "pred", self.cond(cond, pctx)          # FILTER(ALL(col), cond) == boolean filter
                 return "review", "FILTER over a computed table (VALUES, ALLSELECTED ...)"
             if name == "KEEPFILTERS" and a:
-                self.note("KEEPFILTERS: the filter intersects instead of replacing; SQL does the same.")
                 kind, payload = self.filter_arg(a[0], pctx)
+                if kind == "total":                        # every value, intersected with the current filter: nothing
+                    self.note("KEEPFILTERS(ALL(...)) keeps the current filters (no total is computed); confirm in "
+                              "Power BI if the result looks off.")
+                    return "none", None
+                self.note("KEEPFILTERS: the filter intersects instead of replacing; SQL does the same.")
                 if kind == "all":
                     return "review", "KEEPFILTERS(FILTER(ALL(...))): needs a separate dataset"
                 return ("keep" if kind == "pred" else kind), payload
-            if name in ("REMOVEFILTERS", "ALL", "ALLSELECTED"):
-                kind = "ALLSELECTED" if name == "ALLSELECTED" else "ALL"
+            if name in ("REMOVEFILTERS", "ALL", "ALLSELECTED", "ALLNOBLANKROW"):
+                kind = "ALLSELECTED" if name == "ALLSELECTED" else "ALL"   # ALLNOBLANKROW: as ALL, as a modifier
                 if not a:
-                    return "total", (("*",), (), kind)
+                    return "total", (("*",), (), kind, ())
                 ts = [self.table_arg(x) for x in a]
                 if all(ts):
-                    return "total", (tuple(ts), (), kind)
+                    return "total", (tuple(ts), (), kind, ())
                 cols = [self.column_arg(x, pctx) for x in a]
                 if all(cols):
-                    return "total", ((), tuple(Col(*c) for c in cols), kind)
+                    return "total", ((), tuple(Col(*c) for c in cols), kind, ())
+            if name == "ALLEXCEPT" and len(a) >= 2 and self.table_arg(a[0]):
+                kept = [self.column_arg(x, pctx) for x in a[1:]]
+                if all(kept):
+                    return "total", ((self.table_arg(a[0]),), (), "ALL", tuple(Col(*c) for c in kept))
             if name in FILTER_MODIFIERS:
                 return "review", f"{name}(...) removes filters: needs a window function or a separate dataset"
             if name in RELATIONSHIP_FNS:
