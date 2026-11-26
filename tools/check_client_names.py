@@ -1,9 +1,10 @@
 """Check that no name from a client report (table, column or measure of a file in samples/ or uploads/) appears in
 the files git tracks or is about to commit.
 
-    python tools/check_client_names.py [--min-length 5] [--staged]
+    python tools/check_client_names.py [--min-length 5] [--staged | --history]
 
-Prints file:line and the name for each hit and exits 1 when there is any. Generic words (Date, Amount, Region ...)
+--history scans every commit instead (messages and diffs, `git log -p --all`). Prints file:line (or commit) and the
+name for each hit and exits 1 when there is any. Generic words (Date, Amount, Region ...)
 are skipped: they are in every report and identify no client. Reads only the model's metadata, never data rows.
 """
 from __future__ import annotations
@@ -28,6 +29,8 @@ GENERIC = {
     "revenue", "profit", "margin", "discount", "channel", "segment", "source", "period", "flag", "label",
     "active", "inactive", "reference", "today", "timestamp", "placeholder", "printed", "created by", "display name",
     "fiscal year", "root cause", "conversion", "column1", "column2", "column3", "product code",
+    "width", "height", "length", "weight", "volume", "chain", "prefix", "monthid", "itemid", "postalcode",
+    "district", "store count", "sales ly",
 }
 
 
@@ -68,6 +71,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--min-length", type=int, default=5)
     ap.add_argument("--staged", action="store_true", help="check only the staged files")
+    ap.add_argument("--history", action="store_true", help="check every commit message and diff instead")
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -77,6 +81,19 @@ def main(argv=None) -> int:
         return 0
     pats = [(n, re.compile(r"(?<![A-Za-z0-9_])" + re.escape(n) + r"(?![A-Za-z0-9_])", re.I)) for n in names]
     hits = 0
+    if args.history:
+        log = subprocess.run(["git", "log", "-p", "--all", "--format=commit %H%n%B"], cwd=ROOT, capture_output=True,
+                             check=True).stdout.decode("utf-8", errors="replace")
+        commit = ""
+        for line in log.splitlines():
+            if line.startswith("commit "):
+                commit = line[7:15]
+            for n, p in pats:
+                if p.search(line):
+                    print(f"{commit}: {n}: {line[:120]}")
+                    hits += 1
+        print(f"{len(names)} client names checked against every commit, {hits} hit(s).")
+        return 1 if hits else 0
     for f in tracked_files(args.staged):
         if f.suffix.lower() in (".woff2", ".png", ".jpg", ".xlsx", ".pdf", ".zip"):
             continue
