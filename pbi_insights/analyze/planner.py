@@ -7,7 +7,7 @@ import logging
 from .dax_parser import DaxSyntaxError, parse_dax, walk as ast_walk
 from .dax_translate import ModelIndex, Translator, classify_measure
 from .graph import RelGraph
-from .ir import Agg, Bin, Col, Fn, InList, Lit, Null, Scalar, Total, Un, aggs_in, cols_in
+from .ir import Agg, Bin, Col, Fn, InList, Lit, Null, Scalar, Total, Un, aggs_in, cols_in, walk, windowable_total
 from .querygen import Dim, FilterSpec, MeasureSpec, Naming, QueryBuilder, QueryPlan, SortSpec
 from .sqlrender import Renderer, column, snake
 
@@ -314,6 +314,9 @@ class Planner:
                 continue
             if f.get("filter_type") in ("TopN", "RelativeDate", "RelativeTime"):
                 base["reviews"].append(f"{f['filter_type']} filter ({f['condition']}) needs manual SQL")
+                if f.get("filter_type") == "TopN" and any(windowable_total(x) for m in measures for x in walk(m.ir)):
+                    base["reviews"].append("a Top N filter with a total at a coarser grain (ALL / ALLSELECTED): the "
+                                           "window sees only the rows the Top N keeps")
                 continue
             irs = [cond_tree_ir(t, self.idx) for t in f.get("condition_tree", [])]
             if not irs or any(x is None for x in irs):
