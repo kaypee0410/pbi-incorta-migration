@@ -117,8 +117,11 @@ def test_totals_no_filter_can_reach():
     plan, got = _query("VAR a = CALCULATE(AVERAGE(Sales[Amount]), REMOVEFILTERS(Sales)) "
                        "RETURN CALCULATE([Total], Sales[Amount] >= a)", REGION)
     assert got == [("East", 50.0)] and not plan.reviews
-    for dax in ("CALCULATE([Total], REMOVEFILTERS(Sales[Scenario]))", "CALCULATE([Total], ALL(Store))"):
-        assert _query(dax, REGION)[0].reviews                 # other filters still apply: not a plain total
+    # other filters still apply: not a plain total, a window over the visual's rows (tests/test_all_removefilters.py)
+    plan, got = _query("CALCULATE([Total], REMOVEFILTERS(Sales[Scenario]))", REGION)
+    assert got == [("East", 65.0), ("West", 16.0)] and "OVER (PARTITION BY" in plan.sql
+    plan, got = _query("CALCULATE([Total], ALL(Store))", REGION)
+    assert got == [("East", 81.0), ("West", 81.0)] and "OVER ()" in plan.sql
 
 
 def test_running_total_and_unreachable_context_are_flagged():

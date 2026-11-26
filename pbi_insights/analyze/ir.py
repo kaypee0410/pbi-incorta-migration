@@ -170,6 +170,40 @@ class Total:
     tables: tuple = ()
     columns: tuple = ()          # (Col, ...)
     independent: str = ""        # table the value is computed on when no filter of the report can reach it
+    kind: str = "ALL"            # ALL (also REMOVEFILTERS) or ALLSELECTED (keeps slicers, removes the visual's grouping)
+
+
+WINDOW_AGG = {"SUM": "SUM", "COUNT": "SUM", "MIN": "MIN", "MAX": "MAX"}     # aggregate -> how its group values add up
+NESTED_TOTAL = ("REMOVEFILTERS / ALL: a total at a coarser grain inside an aggregate's filter needs a total CTE at the "
+                "coarser grain")
+_AGG_WORD = {"AVG": "AVERAGE", "MEDIAN": "MEDIAN", "COUNT": "DISTINCTCOUNT"}
+
+
+def window_total_issue(t: Total) -> str:
+    """"" when a total at a coarser grain (CALCULATE + ALL / REMOVEFILTERS / ALLSELECTED that does not remove every
+    filter) is a window over the visual's rows: each aggregate inside is additive (SUM, COUNT, COUNTROWS, MIN, MAX),
+    so its value at the coarser grain is the SUM / MIN / MAX of its values per group. Otherwise the reason it is not."""
+    if t.independent:
+        return ""
+    for n in walk(t.expr, into_scalar=False):
+        if isinstance(n, Total) and not n.independent or isinstance(n, (Review, TimeShift, Rank, CorrAgg, Lookup)):
+            return ("REMOVEFILTERS / ALL: needs a total at a coarser grain around a construct a window cannot "
+                    "take (window function or a separate query)")
+    aggs = top_aggs(t.expr)                       # a filter-independent value inside stays its own subquery
+    for a in aggs:
+        if a.func not in WINDOW_AGG or a.distinct:
+            word = _AGG_WORD.get(a.func, a.func) if a.func != "COUNT" or a.distinct else a.func
+            return f"REMOVEFILTERS / ALL: {word} is not additive, so it needs a total CTE at the coarser grain"
+        if any(isinstance(v, Agg) for v in context_values(a)):
+            return ("REMOVEFILTERS / ALL: a value of the visual inside the total needs a total CTE at the coarser "
+                    "grain")
+    if not aggs:
+        return "REMOVEFILTERS / ALL: needs a total at a coarser grain (window function or a separate query)"
+    return ""
+
+
+def windowable_total(n) -> bool:
+    return isinstance(n, Total) and not n.independent and not window_total_issue(n)
 
 
 IR_TYPES = (Col, Lit, Null, Star, Agg, Bin, Un, Case, Fn, SafeDiv, BlankArith, IsNull, InList, Scalar, Review,
@@ -287,7 +321,9 @@ def sql_gaps(node) -> list[str]:
         elif isinstance(n, Rank):
             why = "RANKX: needs a window function over the rows of the visual"
         elif isinstance(n, Total) and not n.independent:
-            why = "REMOVEFILTERS / ALL: needs a total at a coarser grain (window function or a separate query)"
+            why = window_total_issue(n) or None
+        elif isinstance(n, Agg) and any(windowable_total(x) for p in (n.arg, n.pred) for x in walk(p)):
+            why = NESTED_TOTAL
         elif isinstance(n, CorrAgg) and n.table == n.host and not n.windowable:
             why = n.complex or "per-row aggregate with a condition that is not an equality: needs a self-join"
         elif isinstance(n, CorrAgg) and n.table != n.host and (n.keys or n.complex):

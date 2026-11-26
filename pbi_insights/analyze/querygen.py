@@ -19,7 +19,7 @@ from sqlglot import exp
 
 from .graph import RelGraph
 from .ir import (Agg, BlankArith, Bin, Case, Col, Fn, Lit, Null, Review, SafeDiv, Scalar, Total, Un, children, cols_in,
-                 context_values, reviews_in, row_cols, top_aggs)
+                 context_values, reviews_in, row_cols, top_aggs, windowable_total)
 from .sqlrender import Renderer, column, literal, not_null, snake, table_ref
 
 DEFAULT_VIEW_PREFIX = "vw_"
@@ -66,6 +66,7 @@ class QueryPlan:
     joins: list = field(default_factory=list)
     notes: list = field(default_factory=list)
     reviews: list = field(default_factory=list)
+    select: object = field(default=None, repr=False)    # the sqlglot query behind `sql` (grouped queries)
 
 
 class Naming:
@@ -264,6 +265,11 @@ class QueryBuilder:
             plan.reviews += [r for r in reviews_in(m.ir) if r not in plan.reviews]
         if not measures:
             return self._distinct(dims, filters, sorts, plan)
+        if any(_window_totals(m.ir) for m in measures):
+            return self._windowed(dims, measures, filters, sorts, plan)
+        return self._grouped(dims, measures, filters, sorts, plan)
+
+    def _grouped(self, dims, measures, filters, sorts, plan: QueryPlan, hide_blank: bool = True) -> QueryPlan:
         groups: dict[str, list[Agg]] = {}
         for m in measures:
             for a in top_aggs(m.ir):
@@ -316,8 +322,87 @@ class QueryBuilder:
         if len(groups) == 1:
             t = next(iter(groups))
             if len(info[t]["keys"]) == len(dims):
-                return self._single(t, info[t], dims, measures, sorts, plan)
-        return self._multi(info, dims, measures, sorts, plan)
+                return self._single(t, info[t], dims, measures, sorts, plan, hide_blank)
+        return self._multi(info, dims, measures, sorts, plan, hide_blank)
+
+    # ---- totals at a coarser grain (ALL / REMOVEFILTERS / ALLSELECTED): group first, then a window ----------------
+    def _removes(self, t: Total):
+        """(table, column) -> does the total remove the filters / grouping on this column?"""
+        tables = set()
+        for x in t.tables:
+            tables |= self._reach(x) if x != "*" else set()
+        return lambda table, col: "*" in t.tables or table in tables or Col(table, col) in t.columns
+
+    def _windowed(self, dims, measures, filters, sorts, plan: QueryPlan) -> QueryPlan:
+        """Inner query: one row per group of the visual with every aggregate as a column. Outer query: the measures,
+        each aggregate of a total at a coarser grain as SUM / MIN / MAX(column) OVER (PARTITION BY the visual's
+        dimensions except those the total removes)."""
+        totals = [t for m in measures for t in _window_totals(m.ir)]
+        for t in totals:
+            if t.kind == "ALLSELECTED":                    # slicers stay by design
+                continue
+            removes = self._removes(t)
+            for f in filters:
+                hit = next((c for c in cols_in(f.ir) if removes(c.table, c.column)), None)
+                if hit is not None:
+                    level = f.text.split(":", 1)[0].strip().lower()
+                    what = "slicer" if level == "slicer" else f"{level} filter"
+                    self._review(plan, f"Power BI's total ignores the {what} on {hit.table}[{hit.column}]; compute the "
+                                       f"total in a CTE without that filter.")
+        inner, cols = [], {}
+        for m in measures:
+            for a in top_aggs(m.ir):
+                if repr(a) not in cols:
+                    spec = MeasureSpec(name=f"agg_{len(inner) + 1}", out=f"agg_{len(inner) + 1}", ir=a)
+                    inner.append(spec)
+                    cols[repr(a)] = spec
+        for m in measures if dims else ():
+            if _has_fixed_value(m.ir) and not _blank_without_rows(m.ir):
+                self._review(plan, f"[{m.name}] has a value for groups without rows (it uses a total that does not "
+                                   f"come from the group's own rows): Power BI shows those groups too, the SQL does not")
+        self._name_outputs(dims, inner)                    # same dimension names as the measures got in build()
+        sub = self._grouped(dims, inner, filters, [], plan, hide_blank=False)
+        if sub.select is None:                             # no grouped query (should not happen: totals hold aggregates)
+            return sub
+        key = "with_" if "with_" in exp.Select.arg_types else "with"
+        with_ = sub.select.args.get(key)                   # CTEs of the grouped query move to the top
+        if with_:
+            sub.select.set(key, None)
+        al = _Aliases()
+
+        def part(t: Total):
+            removes = self._removes(t)
+            return [column(d.out, "q") for d in dims if not removes(d.table, d.column)]
+
+        rnd = Renderer(self.dialect, col_fn=lambda c: column(c.column, al(c.table)),
+                       agg_fn=lambda a: column(cols[repr(a)].out, "q") if repr(a) in cols
+                       else Renderer.review_null("an aggregate missing from the grouped query"),
+                       scalar_fn=lambda s: self._scalar(s, al), total_fn=part)
+        out_cols = []
+        for d in dims:
+            out_cols.append(column(d.out, "q"))
+            if d.sort_by:
+                out_cols.append(column(d.sort_out, "q"))
+        out_cols += [exp.alias_(rnd.r(m.ir), m.out) for m in measures]
+        sel = exp.select(*out_cols).from_(sub.select.subquery("q"))
+        src = None
+        if dims and _hide_blank_rows(measures):            # a window cannot sit in WHERE: filter one level up
+            sel = exp.select(*[column(c.alias_or_name, "w") for c in sel.selects]).from_(sel.subquery("w"))
+            sel = sel.where(_or([not_null(column(m.out, "w")) for m in measures]))
+            src = "w"
+        order = self._order(sorts, lambda d, sort_key=False: column(d.sort_out if sort_key and d.sort_out else d.out,
+                                                                     src or "q"),
+                            lambda m: column(m.out, src) if src else column(m.out))
+        if order:
+            sel = sel.order_by(*order)
+        if with_:
+            sel.set(key, with_)
+        plan.form = "multi-grain"
+        plan.notes.append("A measure takes a total at a coarser grain (ALL / REMOVEFILTERS / ALLSELECTED): the query "
+                          "groups by the visual's dimensions first, then a window adds the groups up.")
+        plan.select = sel
+        plan.sql = sel.sql(dialect=self.dialect, pretty=True)
+        return plan
 
     def _name_outputs(self, dims: list[Dim], measures: list[MeasureSpec]):
         used = set()
@@ -339,7 +424,7 @@ class QueryBuilder:
             used.add(name.lower())
 
     # ---- single table: one GROUP BY -------------------------------------------------------------
-    def _single(self, t, inf, dims, measures, sorts, plan: QueryPlan) -> QueryPlan:
+    def _single(self, t, inf, dims, measures, sorts, plan: QueryPlan, hide_blank: bool = True) -> QueryPlan:
         al = _Aliases()
         al(t)
         rnd = self._renderer(al, ctx_fn=self._ctx_fn(inf["ctx_cols"]))
@@ -366,7 +451,7 @@ class QueryBuilder:
                             lambda d, sort_key=False: column(d.sort_by if sort_key and d.sort_by else d.column,
                                                              al(d.table)),
                             lambda m: column(m.out))
-        if dims and measures and _hide_blank_rows(measures):
+        if hide_blank and dims and measures and _hide_blank_rows(measures):
             if len(measures) == 1:
                 sel = sel.having(not_null(rnd.r(measures[0].ir)))
             else:
@@ -381,11 +466,12 @@ class QueryBuilder:
         for name, _, cte in inf["ctx"]:
             sel = sel.with_(name, as_=cte)
         plan.form = "multi-grain" if inf["ctx"] else "single"
+        plan.select = sel
         plan.sql = sel.sql(dialect=self.dialect, pretty=True)
         return plan
 
     # ---- several grains: one CTE per aggregated table ---------------------------------------------
-    def _multi(self, info, dims, measures, sorts, plan: QueryPlan) -> QueryPlan:
+    def _multi(self, info, dims, measures, sorts, plan: QueryPlan, hide_blank: bool = True) -> QueryPlan:
         al = _Aliases()
         for t in info:
             al(t)
@@ -457,7 +543,7 @@ class QueryBuilder:
                 sel = sel.join(exp.to_table(name), on=on, join_type="left")
             else:
                 sel = sel.join(exp.to_table(name), join_type="cross")
-        if dims and _hide_blank_rows(measures):
+        if hide_blank and dims and _hide_blank_rows(measures):
             sel = sel.where(_or([not_null(e.copy()) for _, e in meas]))
         order = self._order(sorts,
                             lambda d, sort_key=False: column(d.sort_out if sort_key and d.sort_out else d.out,
@@ -474,6 +560,7 @@ class QueryBuilder:
         plan.form = "multi-grain"
         plan.notes.append("Aggregates come from different tables (" + ", ".join(info) + "): each is computed at its "
                           "own grain in a CTE and joined on the shared dimensions, so nothing is double counted.")
+        plan.select = sel
         plan.sql = sel.sql(dialect=self.dialect, pretty=True)
         return plan
 
@@ -572,10 +659,21 @@ def _same(a: exp.Expression, b: exp.Expression) -> exp.Expression:
 
 
 def _has_fixed_value(n) -> bool:
-    """A filter-independent value outside the aggregates."""
+    """A value outside the aggregates that does not come from the group's own rows: filter-independent, or a total at
+    a coarser grain."""
     if isinstance(n, Agg):
         return False
-    return isinstance(n, Scalar) or (isinstance(n, Total) and bool(n.independent)) or any(_has_fixed_value(c) for c in children(n))
+    return isinstance(n, Scalar) or isinstance(n, Total) or any(_has_fixed_value(c) for c in children(n))
+
+
+def _window_totals(n) -> list:
+    """Totals at a coarser grain the visual's query computes as a window (not those inside an aggregate's filter, which
+    are flagged for review, nor those inside a filter-independent value)."""
+    if windowable_total(n):
+        return [n]
+    if isinstance(n, (Agg, Scalar)) or (isinstance(n, Total) and n.independent):
+        return []
+    return [t for c in children(n) for t in _window_totals(c)]
 
 
 def _blank_without_rows(n) -> bool:

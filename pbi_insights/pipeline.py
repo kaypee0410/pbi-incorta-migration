@@ -36,6 +36,9 @@ PATTERN_NOTES = {
                                  "the fact join (which would count fact rows).",
     "Filter-independent (ALL)": "Ignores report filters (FILTER(ALL(...))): keep it out of dashboard filter scope "
                                 "(Incorta: a groupBy() level-based measure).",
+    "Total at a coarser grain (ALL)": "Takes a total with some filters or groupings removed (ALL / REMOVEFILTERS / "
+                                      "ALLSELECTED on columns or a lookup table): a window over the insight's rows "
+                                      "in SQL (Insight SQL tab), a groupBy() level-based measure in Incorta.",
     "Time intelligence": "Uses time-intelligence functions: rebuild with a date table (period offsets in SQL).",
 }
 

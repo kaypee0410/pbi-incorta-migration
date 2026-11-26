@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 from .dax_parser import DaxSyntaxError, functions_used, parse_dax
 from .ir import (Agg, BlankArith, Bin, Case, Col, CorrAgg, Fn, InList, IsNull, Lit, Lookup, Null, OuterCol, Rank,
                  Review, SafeDiv, Scalar, Star, TimeShift, Total, Un, aggs_in, and_, cols_in, conjuncts, has_agg, has_outer,
-                 is_boolean, override, reviews_in, row_cols, transform, walk)
+                 is_boolean, override, reviews_in, row_cols, transform, walk, window_total_issue, windowable_total)
 
 AGG = {"SUM": "SUM", "AVERAGE": "AVG", "MIN": "MIN", "MAX": "MAX", "COUNT": "COUNT", "COUNTA": "COUNT",
        "MEDIAN": "MEDIAN"}
@@ -305,6 +305,12 @@ class Translator:
     def measure_ref(self, name: str, ctx: _Ctx):
         self.acc.add(self.acc.measure_refs, name)
         if ctx.mode == "row":
+            if not ctx.calc and name not in self._stack:   # a value no filter can reach is the same on every row
+                sizes = len(self.acc.notes), len(self.acc.patterns), len(self.acc.reviews)
+                ir = self.measure_ref(name, _Ctx(host=self.idx.measures[name]["table"]))
+                if isinstance(ir, Scalar) or (isinstance(ir, Total) and ir.independent):
+                    return ir
+                del self.acc.notes[sizes[0]:], self.acc.patterns[sizes[1]:], self.acc.reviews[sizes[2]:]
             return self.review(f"measure [{name}] evaluated per row (context transition): needs a grouped subquery")
         if name in self._stack:
             return self.review(f"circular reference to [{name}]")
@@ -863,9 +869,11 @@ class Translator:
                     return self.review("two time-intelligence filters in one CALCULATE")
                 shift = payload
             elif kind == "total":
-                tables, cols = removed or ((), ())
+                tables, cols, rkind = removed or ((), (), payload[2])
+                if rkind != payload[2]:
+                    return self.review("ALL / REMOVEFILTERS and ALLSELECTED in one CALCULATE: needs a separate dataset")
                 removed = (tables + tuple(x for x in payload[0] if x not in tables),
-                           cols + tuple(x for x in payload[1] if x not in cols))
+                           cols + tuple(x for x in payload[1] if x not in cols), rkind)
             else:
                 return self.review(payload)
         if independent and (new is not None or keep is not None or tfilters):
@@ -897,12 +905,26 @@ class Translator:
         if shift or removed:
             inner = _replaces(self.tr(expr, ctx_in), replaced)
             if removed:
-                self.pattern("Share of total (REMOVEFILTERS)")
-                alone = "" if shift or tfilters else self._independent_of_filters(inner, removed)
+                tables, cols, rkind = removed
+                alone = ("" if shift or tfilters or rkind == "ALLSELECTED"
+                         else self._independent_of_filters(inner, removed))
+                inner = Total(inner, tables, cols, alone, rkind)
                 if alone:
-                    self.note(f"REMOVEFILTERS / ALL on {alone}: the value ignores every slicer and filter, so the SQL "
-                              f"computes it on its own.")
-                inner = Total(inner, removed[0], removed[1], alone)
+                    self.pattern("Filter-independent (ALL)")
+                    self.note(f"ALL / REMOVEFILTERS removes every filter on {alone} and the tables it looks up, so this "
+                              f"value ignores slicers and filters on them.")
+                elif window_total_issue(inner):
+                    self.pattern("Share of total (REMOVEFILTERS)")
+                else:
+                    self.pattern("Total at a coarser grain (ALL)")
+                    what = ", ".join(["every table" if t == "*" else t for t in tables]
+                                     + [f"{c.table}[{c.column}]" for c in cols])
+                    if rkind == "ALLSELECTED":
+                        self.note(f"ALLSELECTED({what}) keeps the slicers and page filters (they stay in the WHERE); the "
+                                  f"SQL window removes only the visual's own grouping by {what}.")
+                    else:
+                        self.note(f"ALL / REMOVEFILTERS on {what}: the total is a window over the visual's rows, "
+                                  f"partitioned by the visual's dimensions except those.")
             if shift:
                 self.pattern("Time intelligence")
                 inner = TimeShift(inner, *shift)
@@ -931,7 +953,7 @@ class Translator:
 
     def _without(self, pred, removed):
         """The filters of an outer CALCULATE that REMOVEFILTERS / ALL clears: (tables, columns)."""
-        tables, columns = removed
+        tables, columns = removed[:2]
         if "*" in tables:
             return None
         cleared = set(tables)
@@ -946,7 +968,7 @@ class Translator:
     def _independent_of_filters(self, inner, removed) -> str:
         """The table of `inner` when REMOVEFILTERS / ALL clears everything that can filter it: every table that
         filters T is one T looks up (no both-way or many-to-many relationship around it). "" otherwise."""
-        tables, columns = removed
+        tables, columns = removed[:2]
         aggs = aggs_in(inner)
         host = {a.table for a in aggs}
         if len(host) != 1 or columns or self.graph is None or any(
@@ -985,15 +1007,16 @@ class Translator:
                 if kind == "all":
                     return "review", "KEEPFILTERS(FILTER(ALL(...))): needs a separate dataset"
                 return ("keep" if kind == "pred" else kind), payload
-            if name in ("REMOVEFILTERS", "ALL"):
+            if name in ("REMOVEFILTERS", "ALL", "ALLSELECTED"):
+                kind = "ALLSELECTED" if name == "ALLSELECTED" else "ALL"
                 if not a:
-                    return "total", (("*",), ())
+                    return "total", (("*",), (), kind)
                 ts = [self.table_arg(x) for x in a]
                 if all(ts):
-                    return "total", (tuple(ts), ())
+                    return "total", (tuple(ts), (), kind)
                 cols = [self.column_arg(x, pctx) for x in a]
                 if all(cols):
-                    return "total", ((), tuple(Col(*c) for c in cols))
+                    return "total", ((), tuple(Col(*c) for c in cols), kind)
             if name in FILTER_MODIFIERS:
                 return "review", f"{name}(...) removes filters: needs a window function or a separate dataset"
             if name in RELATIONSHIP_FNS:
@@ -1132,8 +1155,10 @@ def classify_measure(tr: Translation, ast_is_alias: bool, graph=None) -> tuple[s
         return "Needs review", "High"
     if isinstance(ir, Lit):
         return "Constant", "Low"
-    if isinstance(ir, Scalar) or any(isinstance(x, Scalar) for x in _walk_top(ir)):
-        return "Filter-independent (ALL)", "Medium"
+    if any(isinstance(x, Scalar) or (isinstance(x, Total) and x.independent) for x in _walk_top(ir)):
+        return "Filter-independent (ALL)", "Medium"        # anywhere, also inside an aggregate's filter
+    if any(windowable_total(x) for x in _walk_top(ir)):
+        return "Total at a coarser grain (ALL)", "Medium"
     aggs = aggs_in(ir)
     tables = {a.table for a in aggs}
     if graph and len(tables) > 1 and any(t2 in graph.reachable(t1) for t1 in tables for t2 in tables if t1 != t2):

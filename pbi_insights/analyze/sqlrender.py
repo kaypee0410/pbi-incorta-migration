@@ -5,8 +5,8 @@ import re
 
 from sqlglot import exp
 
-from .ir import (Agg, BlankArith, Bin, Case, Col, CorrAgg, Fn, InList, IsNull, Lit, Lookup, Null, OuterCol, Rank,
-                 Review, SafeDiv, Scalar, Star, TimeShift, Total, Un, sql_gaps)
+from .ir import (NESTED_TOTAL, WINDOW_AGG, Agg, BlankArith, Bin, Case, Col, CorrAgg, Fn, InList, IsNull, Lit, Lookup,
+                 Null, OuterCol, Rank, Review, SafeDiv, Scalar, Star, TimeShift, Total, Un, sql_gaps, windowable_total)
 
 RESERVED = {
     "ADD", "ALL", "ALTER", "AND", "ANY", "AS", "ASC", "BETWEEN", "BY", "CASE", "CAST", "CHECK", "COLUMN",
@@ -86,7 +86,8 @@ class Renderer:
     """IR -> sqlglot. `col_fn(Col)` places columns; `agg_fn(Agg)` may redirect an aggregate to a
     pre-computed column (multi-grain queries); `scalar_fn(Scalar)` builds filter-independent subqueries."""
 
-    def __init__(self, dialect: str, col_fn, agg_fn=None, scalar_fn=None, lookup_fn=None, corr_fn=None, ctx_fn=None):
+    def __init__(self, dialect: str, col_fn, agg_fn=None, scalar_fn=None, lookup_fn=None, corr_fn=None, ctx_fn=None,
+                 total_fn=None):
         self.dialect = dialect
         self.col_fn = col_fn
         self.agg_fn = agg_fn
@@ -94,7 +95,9 @@ class Renderer:
         self.lookup_fn = lookup_fn      # Lookup -> expression (scalar subquery on the lookup table)
         self.corr_fn = corr_fn          # CorrAgg over another table -> expression (grouped subquery)
         self.ctx_fn = ctx_fn            # value of the visual used inside an aggregate -> pre-computed column
+        self.total_fn = total_fn        # Total -> PARTITION BY expressions of its window (None: generic comment)
         self._inside = False            # rendering the argument / filter of an aggregate
+        self._window = None             # (partition expressions, comment) while rendering a windowed total
 
     def _child(self, node, parent_prec: int, right: bool = False, strict_ops=("-", "/")) -> exp.Expression:
         e = self.r(node)
@@ -164,9 +167,38 @@ class Renderer:
             return self.review_null(f"lookup in {n.result.table}: join it in")
         if isinstance(n, OuterCol):
             return self.col_fn(Col(n.table, n.column))
+        if windowable_total(n) and self._window is None and not self._inside:
+            return self.window_total(n)
         if isinstance(n, (TimeShift, Rank, Total)):
-            return self.review_null(sql_gaps(n)[0])
+            gaps = sql_gaps(n)
+            return self.review_null(gaps[0] if gaps else NESTED_TOTAL)
         raise TypeError(f"Cannot render {n!r}")
+
+    def window_total(self, n: Total) -> exp.Expression:
+        """Total at a coarser grain: each aggregate of `n.expr` becomes SUM / MIN / MAX(<its value per group>) OVER
+        (PARTITION BY the visual's dimensions except the removed ones). Without `total_fn` the partition is not known
+        (one measure on its own), so the window is OVER () with a comment naming what the partition leaves out."""
+        if self.total_fn:
+            part, comment = self.total_fn(n), None
+        else:
+            removed = ", ".join(["every table" if t == "*" else t for t in n.tables]
+                                + [f"{c.table}[{c.column}]" for c in n.columns])
+            what = (f"the visual's own grouping by {removed} (slicers stay)" if n.kind == "ALLSELECTED"
+                    else f"the visual's dimensions except {removed}")
+            part, comment = [], f" PARTITION BY {what} "
+        self._window = (part, comment)
+        try:
+            return self.r(n.expr)
+        finally:
+            self._window = None
+
+    def _windowed(self, a: Agg, value: exp.Expression) -> exp.Expression:
+        part, comment = self._window
+        outer = {"SUM": exp.Sum, "MIN": exp.Min, "MAX": exp.Max}[WINDOW_AGG[a.func]]
+        w = exp.Window(this=outer(this=value), partition_by=[p.copy() for p in part] or None)
+        if comment:
+            w.add_comments([comment])
+        return w
 
     @staticmethod
     def review_null(reason: str) -> exp.Expression:
@@ -203,6 +235,13 @@ class Renderer:
     def agg(self, a: Agg) -> exp.Expression:
         if self._inside:
             return self.ctx_fn(a) if self.ctx_fn else self.review_null("a value of the visual inside an aggregate")
+        if self._window is not None:
+            window, self._window = self._window, None      # the aggregate's own value per group, then the window
+            try:
+                value = self.agg(a)
+            finally:
+                self._window = window
+            return self._windowed(a, value)
         if self.agg_fn:
             res = self.agg_fn(a)
             if res is not None:
