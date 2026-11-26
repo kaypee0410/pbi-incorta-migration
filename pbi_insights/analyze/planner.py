@@ -56,8 +56,21 @@ GEO_CATEGORIES = {"PostalCode", "City", "Country", "StateOrProvince", "County", 
 
 
 # ------------------------------------------------------------------------------------------ helpers
+TABLE_COLUMN_MAKERS = {"ADDCOLUMNS", "SELECTCOLUMNS", "SUMMARIZE", "SUMMARIZECOLUMNS", "GROUPBY", "ROW",
+                       "ADDMISSINGITEMS", "NATURALINNERJOIN"}
+
+
+def created_columns(ast) -> set[str]:
+    """Names (lower case) of the columns a DAX expression creates itself: ADDCOLUMNS(..., "Share", ...) and the like."""
+    return {str(a[1]).lower() for n in ast_walk(ast)
+            if n[0] == "func" and str(n[1]).upper() in TABLE_COLUMN_MAKERS for a in n[2] if a[0] == "str"}
+
+
 def measure_dependencies(model: dict, idx: ModelIndex) -> dict:
-    """Direct measure -> measures it references (parsed from the DAX)."""
+    """Direct measure -> measures it references (parsed from the DAX).
+
+    [Name] is a measure unless the same DAX creates a column called Name (ADDCOLUMNS ... "Name", then [Name]);
+    'Table'[Name] is a measure when Table has no column Name and a measure Name exists."""
     deps = {}
     for m in model.get("measures", []):
         try:
@@ -65,12 +78,16 @@ def measure_dependencies(model: dict, idx: ModelIndex) -> dict:
         except DaxSyntaxError:
             deps[m["name"]] = []
             continue
+        created = created_columns(ast)
         refs = []
         for n in ast_walk(ast):
-            if n[0] == "ref":
+            name = None
+            if n[0] == "ref" and str(n[1]).lower() not in created:
                 name = idx.measure(n[1])
-                if name and name != m["name"] and name not in refs:
-                    refs.append(name)
+            elif n[0] == "col" and not idx.column(n[1], n[2]):
+                name = idx.measure(n[2])
+            if name and name != m["name"] and name not in refs:
+                refs.append(name)
         deps[m["name"]] = refs
     return deps
 
