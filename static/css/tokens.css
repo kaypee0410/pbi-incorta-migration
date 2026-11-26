@@ -1,0 +1,38 @@
+/* Design tokens: the only place colours, faces and radii are written. Fonts are bundled (the app runs offline). */
+@font-face{font-family:"Barlow Semi Condensed";font-style:normal;font-weight:500;font-display:swap;
+  src:url("../fonts/barlow-semi-condensed-500.woff2") format("woff2")}
+@font-face{font-family:"Barlow Semi Condensed";font-style:normal;font-weight:600;font-display:swap;
+  src:url("../fonts/barlow-semi-condensed-600.woff2") format("woff2")}
+@font-face{font-family:"Source Sans 3";font-style:normal;font-weight:400 600;font-display:swap;
+  src:url("../fonts/source-sans-3.woff2") format("woff2")}
+@font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:400 500;font-display:swap;
+  src:url("../fonts/jetbrains-mono.woff2") format("woff2")}
+
+:root{
+  --paper:#F2F3F1;
+  --surface:#FFFFFF;
+  --surface-2:#FAFAF8;
+  --grid:#E3E6E2;
+  --ink:#1C2420;
+  --muted:#5B6660;
+  --rule:#D9DDD8;
+  --rule-strong:#B9BFB9;
+  --green:#1F6B4F;
+  --green-dark:#17533D;
+  --green-tint:#E3EFE8;
+  --green-soft:#CFE3D8;
+  --amber:#B7791F;
+  --amber-text:#7E520F;
+  --amber-tint:#F8EBD3;
+  --red:#A33A2E;
+  --red-tint:#F6E3E0;
+  --on-green:#FFFFFF;
+
+  --display:"Barlow Semi Condensed","Arial Narrow",sans-serif;
+  --body:"Source Sans 3","Segoe UI",system-ui,sans-serif;
+  --code:"JetBrains Mono",Consolas,monospace;
+
+  --r:4px;
+  --s1:12px; --s2:24px; --s3:36px; --s4:56px;
+  --page:1120px;
+}

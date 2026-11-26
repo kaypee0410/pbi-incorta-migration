@@ -1,0 +1,26 @@
+<section id="results" aria-labelledby="results-h" hidden>
+  <div class="result-head">
+    <div>
+      <h2 id="results-h">Workbook for <span id="res-file"></span></h2>
+      <p class="meta" id="result-meta"></p>
+    </div>
+    <div class="downloads" id="downloads"></div>
+  </div>
+  <div class="warnings" id="warnings" hidden></div>
+
+  <div class="coverage">
+    <div class="cov-line">
+      <p class="cov-num"><span id="cov-translated"></span><span class="of"> of <span id="cov-measures"></span></span></p>
+      <p class="cov-text">measures translated to SQL automatically</p>
+    </div>
+    <div class="bar" id="bar" role="img"></div>
+    <div class="legend">
+      <span><i class="key key-ok"></i><span id="leg-translated"></span> translated</span>
+      <span><i class="key key-todo"></i><span id="leg-review"></span> to review, grouped below by what blocked them</span>
+    </div>
+    <div class="stats" id="stats"></div>
+  </div>
+
+  <div class="tabs" role="tablist" aria-label="Results" id="tabs"></div>
+  <div id="panels"></div>
+</section>

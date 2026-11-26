@@ -1,0 +1,38 @@
+<header class="hero">
+  <div class="hero-in">
+    <div>
+      <h1>Power BI Extraction Insights</h1>
+      <div class="lede-wrap"><p class="lede">Upload a Power BI file to see its tabs, insights, semantic model, Power Query
+        sources and DAX, and get the plan and package to rebuild it in Incorta.</p></div>
+      <p class="meta">Version {{ version }}, running on this computer</p>
+    </div>
+
+    <svg class="flow" viewBox="0 0 490 232" role="img" aria-labelledby="flow-t">
+      <title id="flow-t">The four parts of a .pbix file are translated into the four parts of an Incorta build: physical schema, materialized views, business schema and dashboards.</title>
+      <text class="sub" x="0" y="14">Your .pbix</text>
+      <text class="sub" x="340" y="14">Incorta build</text>
+
+      <path class="wire" d="M150 48 C172 48 168 128 190 128"/>
+      <path class="wire" d="M150 100 C172 100 168 128 190 128"/>
+      <path class="wire" d="M150 152 C172 152 168 128 190 128"/>
+      <path class="wire" d="M150 204 C172 204 168 128 190 128"/>
+
+      <g class="layer"><rect x=".75" y="28" width="149" height="40" rx="3"/><rect class="tick" x=".75" y="28" width="4" height="40"/><text x="16" y="45">Report tabs</text><text class="sub" x="16" y="60">pages and visuals</text></g>
+      <g class="layer"><rect x=".75" y="80" width="149" height="40" rx="3"/><rect class="tick" x=".75" y="80" width="4" height="40"/><text x="16" y="97">Semantic model</text><text class="sub" x="16" y="112">tables and joins</text></g>
+      <g class="layer"><rect x=".75" y="132" width="149" height="40" rx="3"/><rect class="tick" x=".75" y="132" width="4" height="40"/><text x="16" y="149">Power Query</text><text class="sub" x="16" y="164">sources and steps</text></g>
+      <g class="layer"><rect x=".75" y="184" width="149" height="40" rx="3"/><rect class="tick" x=".75" y="184" width="4" height="40"/><text x="16" y="201">DAX measures</text><text class="sub" x="16" y="216">calculations</text></g>
+
+      <g class="core"><rect x="190" y="101" width="110" height="54" rx="4"/><text x="245" y="125" text-anchor="middle">Translate</text><text class="sub" x="245" y="143" text-anchor="middle">to Spark SQL</text></g>
+
+      <path class="wire out" d="M300 128 C320 128 318 48 340 48"/>
+      <path class="wire out" d="M300 128 C320 128 318 100 340 100"/>
+      <path class="wire out" d="M300 128 C320 128 318 152 340 152"/>
+      <path class="wire out" d="M300 128 C320 128 318 204 340 204"/>
+
+      <g class="tgt"><rect x="340.75" y="28" width="148.5" height="40" rx="3"/><text x="354" y="45">Physical schema</text><text class="sub" x="354" y="60">tables and joins</text></g>
+      <g class="tgt"><rect x="340.75" y="80" width="148.5" height="40" rx="3"/><text x="354" y="97">Materialized views</text><text class="sub" x="354" y="112">Spark SQL MVs</text></g>
+      <g class="tgt"><rect x="340.75" y="132" width="148.5" height="40" rx="3"/><text x="354" y="149">Business schema</text><text class="sub" x="354" y="164">views and formulas</text></g>
+      <g class="tgt"><rect x="340.75" y="184" width="148.5" height="40" rx="3"/><text x="354" y="201">Dashboards</text><text class="sub" x="354" y="216">tabs and insights</text></g>
+    </svg>
+  </div>
+</header>

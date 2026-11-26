@@ -1,0 +1,9 @@
+flask>=3.0,<4
+openpyxl>=3.1
+pandas>=2.1
+pbixray==0.15.5
+sqlglot==30.33.0
+python-dotenv>=1.0
+pymupdf>=1.24,<2
+markdown>=3.5
+duckdb>=1.0           # local layer checks of the Incorta MVs (optional: --no-incorta-check)
