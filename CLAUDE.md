@@ -57,8 +57,11 @@ This file is a starter: grow it as the project grows (decisions, conventions, go
   (repeat the logic or move the table's calculated columns to an MV); joins go child to parent with a unique
   parent key; one MV per grain.
 - Per-row aggregates in calculated columns are `CorrAgg` in the IR (window or grouped subquery); LOOKUPVALUE is
-  `Lookup`, time intelligence `TimeShift`, RANKX `Rank`, REMOVEFILTERS / ALL `Total`. Plain SQL still flags the
-  last three for review; the Incorta formulas cover them.
+  `Lookup`, time intelligence `TimeShift`, RANKX `Rank`, REMOVEFILTERS / ALL / ALLSELECTED `Total`. Plain SQL still
+  flags TimeShift and Rank for review; the Incorta formulas cover them. A `Total` that removes every filter on its
+  table is filter-independent (a scalar subquery, a cross-joined one-row CTE inside aggregates); otherwise it is a
+  window over the visual's rows when its aggregates are additive (`ir.window_total_issue`; the insight SQL groups
+  first, then windows), else Needs review. ALLEXCEPT is not translated yet (docs/plan_a_logic.md).
 
 ## Data handling
 - `uploads/` and `samples/` hold client files: never commit them, never paste their data into chats or docs.
