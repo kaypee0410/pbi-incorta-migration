@@ -1,7 +1,7 @@
 """Regression of the measure translation on every Power BI file in samples/: old code (a git commit) vs the current
 working tree, compared by measure name.
 
-    python tools/regress_measures.py [--before 0d8b5d6] [--data] [--files samples/*.pbix] [--out outputs/regress]
+    python tools/regress_measures.py [--before <commit>] [--data] [--files samples/*.pbix] [--out outputs/regress]
 
 For each file: translated measures before / after, measures whose status went down (Translated -> Needs review),
 measures whose generic SQL changed, and (with --data) how many insight queries run on the saved rows. The old code
@@ -65,7 +65,7 @@ def compare(before: dict, after: dict) -> dict:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--before", default="0d8b5d6", help="git revision of the old code (default: 0d8b5d6)")
+    ap.add_argument("--before", default="", help="git revision of the old code (default: the first commit)")
     ap.add_argument("--data", action="store_true", help="also test-run every insight query on the saved rows")
     ap.add_argument("--files", nargs="*", help="files to run (default: every .pbix / .pbit in samples/)")
     ap.add_argument("--out", default="outputs/regress", help="folder for the JSON report (git-ignored)")
@@ -74,6 +74,9 @@ def main(argv=None) -> int:
         sys.stdout.reconfigure(encoding="utf-8")
     files = [Path(f) for f in args.files] if args.files else sorted(
         p for p in (ROOT / "samples").glob("*") if p.suffix.lower() in (".pbix", ".pbit"))
+    if not args.before:
+        args.before = subprocess.run(["git", "rev-list", "--max-parents=0", "HEAD"], cwd=ROOT, capture_output=True,
+                                     text=True, check=True).stdout.split()[0][:7]
     out_dir = ROOT / args.out
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="regress_"))
