@@ -29,6 +29,7 @@ Thumbs.db
 # Power BI files anywhere
 *.pbix
 *.pbit
+*.bim
 
 # Client report notes (names of client tables / measures): never commit
 docs/private/
